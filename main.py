@@ -1,14 +1,5 @@
-"""
-CALENDARIO DE ADVIENTO NAVIDEÑO - Flet 1.0
-==========================================
-5 días, 5 mini-juegos distintos.
-Sin numpy ni PIL. Solo Flet 1.0.
-
-Instalación:  pip install "flet>=1.0,<2.0"
-Ejecución:    python main.py
-"""
-
 import flet as ft
+import flet_audio as fta
 import json
 import random
 import time
@@ -16,6 +7,8 @@ import math
 import asyncio
 import wave
 import array
+import unicodedata
+import functools
 from pathlib import Path
 
 
@@ -45,8 +38,10 @@ COLOR_PURPLE      = "#7B1FA2"
 
 MUSIC_STATE = {"on": False}
 AUDIO_REFS = {}
+PAGE_REF = {}
 
 # Tareas async activas para poder cancelarlas al cambiar de pantalla
+SESSION = {"id": 0, "tasks": []}
 ACTIVE_TASKS = {"list": []}
 THREAD_STOP = {"flag": False}
 
@@ -199,67 +194,165 @@ def mark_day_complete(day, score):
 
 # ============================================================
 #  AUDIO HELPERS
-#  En Flet 1.0 Audio es un "servicio": basta con mantener la
-#  referencia viva (AUDIO_REFS). NO se agrega a page.overlay.
+#  En Flet 1.x Audio debe añadirse a page.overlay para vincularse
+#  a la página y poder reproducirse.
 # ============================================================
 def init_audio(page):
+    """Inicializa audio y monta los controles en page.overlay."""
+    PAGE_REF["page"] = page
     fx_names = ["correct", "error", "tick", "drop", "click", "shuffle", "win", "lose"]
-    for n in fx_names:
-        AUDIO_REFS[n] = ft.Audio(src=str(ASSETS_DIR / f"fx_{n}.wav"), autoplay=False)
-    AUDIO_REFS["music"] = ft.Audio(src=str(ASSETS_DIR / "music_jingle.wav"), autoplay=False)
+    try:
+        for n in fx_names:
+            p = ASSETS_DIR / f"fx_{n}.wav"
+            a = fta.Audio(src=str(p), autoplay=False)
+            AUDIO_REFS[n] = a
+            page.overlay.append(a)
+        music_path = ASSETS_DIR / "music_jingle.wav"
+        music = fta.Audio(
+            src=str(music_path),
+            autoplay=False,
+            release_mode=fta.ReleaseMode.LOOP,
+        )
+        AUDIO_REFS["music"] = music
+        page.overlay.append(music)
+    except Exception as exc:
+        print(f"Audio desactivado: {exc}")
+        AUDIO_REFS.clear()
+
+
+def _schedule_audio(awaitable):
+    """Programa operaciones async de audio en el loop correspondiente."""
+    if not awaitable:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(awaitable)
+        return
+    except RuntimeError:
+        pass
+
+    page = PAGE_REF.get("page")
+    if page:
+        try:
+            loop = page.session.connection.loop
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(awaitable, loop)
+                return
+        except Exception:
+            pass
+
+    close = getattr(awaitable, "close", None)
+    if close:
+        close()
 
 
 def play_fx(name):
-    a = AUDIO_REFS.get(name)
-    if a:
+    audio = AUDIO_REFS.get(name)
+    if audio:
         try:
-            a.play()
+            _schedule_audio(audio.play())
         except Exception:
             pass
 
 
 def set_music(on):
     MUSIC_STATE["on"] = on
-    m = AUDIO_REFS.get("music")
-    if not m:
+    music = AUDIO_REFS.get("music")
+    if not music:
         return
     try:
-        if on:
-            m.play()
-        else:
-            m.pause()
+        operation = music.play() if on else music.pause()
+        _schedule_audio(operation)
     except Exception:
         pass
 
 
 # ============================================================
 #  NAVEGACIÓN Y TAREAS ASYNC
-#  En Flet 1.0 los handlers sincrónicos corren en el event loop,
-#  así que para no congelar la UI usamos page.run_task + async/await.
 # ============================================================
-def start_task(page, coro):
-    """Arranca una corrutina en el event loop de la página."""
-    task = page.run_task(coro)
+def safe_update(*controls):
+    """Actualiza controles de forma segura, ignorando errores si no están montados."""
+    for c in controls:
+        if c:
+            try:
+                c.update()
+            except Exception:
+                pass
+
+
+def safe_focus(ctrl):
+    """Llama a focus() y programa su corrutina si es asíncrona."""
+    if ctrl and hasattr(ctrl, "focus"):
+        try:
+            res = ctrl.focus()
+            if asyncio.iscoroutine(res):
+                _schedule_audio(res)
+        except Exception:
+            pass
+
+
+def start_task(page, handler):
+    """Inicia una tarea asíncrona ligada a la sesión de pantalla activa."""
+    my_session = SESSION["id"]
+
+    @functools.wraps(handler)
+    async def wrapped_task():
+        current = asyncio.current_task()
+        if current:
+            SESSION["tasks"].append(current)
+        try:
+            if SESSION["id"] == my_session and not THREAD_STOP["flag"]:
+                await handler()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            print(f"Error en tarea async ({getattr(handler, '__name__', 'anon')}): {exc}")
+        finally:
+            if current and current in SESSION["tasks"]:
+                SESSION["tasks"].remove(current)
+
+    THREAD_STOP["flag"] = False
+    task = page.run_task(wrapped_task)
     ACTIVE_TASKS["list"].append(task)
     return task
 
 
-def stop_all_tasks():
+def stop_all_tasks(page=None):
+    """Detiene las tareas de la pantalla anterior antes de navegar."""
+    SESSION["id"] += 1
     THREAD_STOP["flag"] = True
-    ACTIVE_TASKS["list"] = []
-    time.sleep(0.05)
-    THREAD_STOP["flag"] = False
+
+    for task in list(SESSION["tasks"]):
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    SESSION["tasks"].clear()
+
+    for task in list(ACTIVE_TASKS["list"]):
+        try:
+            task.cancel()
+        except Exception:
+            pass
+    ACTIVE_TASKS["list"].clear()
+
+    if page:
+        try:
+            while page.pop_dialog():
+                pass
+        except Exception:
+            pass
 
 
 def go_to(page, builder):
-    stop_all_tasks()
+    stop_all_tasks(page)
     page.controls.clear()
     page.add(builder(page))
     page.update()
 
 
 def make_back_button(page):
-    return ft.ElevatedButton(
+    return ft.Button(
         "← Volver al calendario",
         on_click=lambda e: go_to(page, build_home),
         bgcolor=COLOR_BG_LIGHT, color="white",
@@ -312,13 +405,19 @@ def build_home(page):
         alignment=ft.MainAxisAlignment.CENTER, spacing=15,
     )
 
-    music_btn = ft.ElevatedButton(
-        "🎵 Música" if MUSIC_STATE["on"] else "🔇 Música",
-        on_click=lambda e: (set_music(not MUSIC_STATE["on"]), e.control.update()),
+    def toggle_music(btn):
+        new_state = not MUSIC_STATE["on"]
+        set_music(new_state)
+        btn.content = "🎵 Música" if new_state else "🔇 Música"
+        safe_update(btn)
+
+    music_btn = ft.Button(
+        content="🎵 Música" if MUSIC_STATE["on"] else "🔇 Música",
+        on_click=lambda e: toggle_music(e.control),
         bgcolor=COLOR_RED, color="white",
     )
 
-    reset_btn = ft.TextButton(
+    reset_btn = ft.Button(
         "Reiniciar progreso", icon=ft.Icons.RESTART_ALT,
         on_click=lambda e: reset_progress(page),
     )
@@ -427,13 +526,31 @@ def build_day1(page):
         width=200, height=50,
     )
 
-    stack_children = [ft.Container(
+    def drop_gift(e=None):
+        if not state["running"] or THREAD_STOP["flag"]:
+            return
+        gx = state["santa_x"] + 130
+        gy = state["santa_y"] + 50
+        gift_ctrl = ft.Container(
+            content=ft.Text("🎁", size=30),
+            left=gx, top=gy, width=36, height=36,
+        )
+        play_area.controls.append(gift_ctrl)
+        state["gifts"].append({"x": gx, "y": gy, "vy": 0, "ctrl": gift_ctrl})
+        play_fx("drop")
+        safe_update(play_area)
+
+    # Contenedor de fondo que sí recibe clics en el cielo
+    sky_bg = ft.Container(
         width=900, height=480,
         gradient=ft.LinearGradient(
             begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
             colors=["#1A237E", "#283593", "#3949AB"],
         ),
-    )]
+        on_click=lambda e: drop_gift(),
+    )
+
+    stack_children = [sky_bg]
 
     for _ in range(30):
         stack_children.append(ft.Text("✦", size=random.randint(8, 14), color="#FFE082",
@@ -474,32 +591,17 @@ def build_day1(page):
 
     play_area = ft.Stack(stack_children, width=900, height=480)
 
-    def drop_gift(e=None):
-        if not state["running"]:
-            return
-        gx = state["santa_x"] + 130
-        gy = state["santa_y"] + 50
-        gift_ctrl = ft.Container(
-            content=ft.Text("🎁", size=30),
-            left=gx, top=gy, width=36, height=36,
-        )
-        play_area.controls.append(gift_ctrl)
-        state["gifts"].append({"x": gx, "y": gy, "vy": 0, "ctrl": gift_ctrl})
-        play_fx("drop")
-        play_area.update()
-
-    drop_btn = ft.ElevatedButton(
+    drop_btn = ft.Button(
         "🎁 Soltar regalo  (o clic en el cielo)",
         on_click=drop_gift, bgcolor=COLOR_RED, color="white",
         icon=ft.Icons.CARD_GIFTCARD,
     )
-    play_area.on_click = lambda e: drop_gift()
 
     async def game_loop():
         last = time.time()
         while state["running"] and state["time_left"] > 0 and not THREAD_STOP["flag"]:
             now = time.time()
-            dt = now - last
+            dt = min(0.1, now - last)
             last = now
 
             state["santa_x"] += 90 * dt * state["santa_dir"]
@@ -514,15 +616,17 @@ def build_day1(page):
             santa.top = state["santa_y"]
 
             new_gifts = []
+            score_changed = False
             for g in state["gifts"]:
+                prev_y = g["y"]
                 g["vy"] += 200 * dt
                 g["y"] += g["vy"] * dt
                 landed = False
                 for b in state["buildings"]:
-                    if (b["chim_top"] - 5 <= g["y"] <= b["chim_top"] + 10 and
+                    if (prev_y <= b["chim_top"] + 15 and g["y"] >= b["chim_top"] - 5 and
                         b["chim_x"] - 5 <= g["x"] + 18 <= b["chim_x"] + b["chim_w"] + 5):
                         state["score"] += 1
-                        score_txt.value = f"🎁 Regalos: {state['score']}"
+                        score_changed = True
                         play_fx("correct")
                         try:
                             play_area.controls.remove(g["ctrl"])
@@ -543,6 +647,10 @@ def build_day1(page):
                 new_gifts.append(g)
             state["gifts"] = new_gifts
 
+            if score_changed:
+                score_txt.value = f"🎁 Regalos: {state['score']}"
+                safe_update(score_txt)
+
             for sf in snowflakes_ui:
                 cur_top = sf.top + 30 * dt * 2
                 if cur_top > 480:
@@ -550,31 +658,29 @@ def build_day1(page):
                     sf.left = random.randint(0, 880)
                 sf.top = cur_top
 
-            play_area.update()
+            safe_update(play_area)
             await asyncio.sleep(0.03)
 
-        if state["time_left"] <= 0:
-            state["running"] = False
+        if state["time_left"] <= 0 and state["running"] and not THREAD_STOP["flag"]:
             end_game()
 
     async def timer_loop():
         while state["running"] and state["time_left"] > 0 and not THREAD_STOP["flag"]:
             await asyncio.sleep(1)
-            if THREAD_STOP["flag"]:
+            if THREAD_STOP["flag"] or not state["running"]:
                 return
             state["time_left"] -= 1
             m, s = divmod(state["time_left"], 60)
             timer_txt.value = f"⏱ {m:02d}:{s:02d}"
-            if state["time_left"] <= 10:
+            if state["time_left"] <= 10 and state["time_left"] > 0:
                 play_fx("tick")
-            try:
-                timer_txt.update()
-            except Exception:
-                pass
-        if state["time_left"] <= 0:
-            state["running"] = False
+            safe_update(timer_txt)
+        if state["time_left"] <= 0 and state["running"] and not THREAD_STOP["flag"]:
+            end_game()
 
     def end_game():
+        if not state["running"] or THREAD_STOP["flag"]:
+            return
         state["running"] = False
         mark_day_complete(1, state["score"])
         play_fx("win")
@@ -588,8 +694,8 @@ def build_day1(page):
         )
         page.show_dialog(dlg)
 
-    start_task(page, game_loop())
-    start_task(page, timer_loop())
+    start_task(page, game_loop)
+    start_task(page, timer_loop)
 
     return ft.Column([
         make_back_button(page), title,
@@ -605,13 +711,15 @@ def build_day1(page):
 def build_day2(page):
     state = {
         "n_boxes": 0, "boxes": [], "target": None,
-        "shuffling": False, "won": False, "hits": 0,
+        "shuffling": False, "won": False, "hits": 0, "round_id": 0,
     }
 
     title = ft.Text("DÍA 2 · ¿Dónde está el regalo?",
                     size=28, weight=ft.FontWeight.BOLD, color=COLOR_GOLD)
 
     def choose_diff(n, e):
+        if state["shuffling"]:
+            return
         state["n_boxes"] = n
         play_fx("click")
         setup_round()
@@ -621,12 +729,12 @@ def build_day2(page):
             ft.Text("Elige dificultad", size=22, color=COLOR_SNOW,
                     weight=ft.FontWeight.BOLD, text_align=ft.TextAlign.CENTER),
             ft.Row([
-                ft.ElevatedButton("😊 Fácil\n(3 cajas)", on_click=lambda e: choose_diff(3, e),
-                                  bgcolor=COLOR_GREEN, color="white"),
-                ft.ElevatedButton("😎 Medio\n(5 cajas)", on_click=lambda e: choose_diff(5, e),
-                                  bgcolor=COLOR_GOLD, color="black"),
-                ft.ElevatedButton("🔥 Difícil\n(7 cajas)", on_click=lambda e: choose_diff(7, e),
-                                  bgcolor=COLOR_RED, color="white"),
+                ft.Button(content="😊 Fácil\n(3 cajas)", on_click=lambda e: choose_diff(3, e),
+                          bgcolor=COLOR_GREEN, color="white"),
+                ft.Button(content="😎 Medio\n(5 cajas)", on_click=lambda e: choose_diff(5, e),
+                          bgcolor=COLOR_GOLD, color="black"),
+                ft.Button(content="🔥 Difícil\n(7 cajas)", on_click=lambda e: choose_diff(7, e),
+                          bgcolor=COLOR_RED, color="white"),
             ], alignment=ft.MainAxisAlignment.CENTER),
             ft.Text("Acierta 3 veces para ganar ⭐", size=14, color=COLOR_GOLD_LIGHT,
                     text_align=ft.TextAlign.CENTER),
@@ -654,14 +762,17 @@ def build_day2(page):
         ], width=70, height=70)
 
     def setup_round():
+        state["round_id"] += 1
+        my_round = state["round_id"]
+
         game_area.controls.clear()
         state["boxes"] = []
         state["target"] = None
-        state["shuffling"] = False
+        state["shuffling"] = True
         state["won"] = False
         info_txt.value = "Mira bien dónde se guarda el regalo..."
         info_txt.color = COLOR_SNOW
-        info_txt.update()
+        safe_update(info_txt)
 
         n = state["n_boxes"]
         gift_emoji = random.choice(GIFTS)
@@ -689,47 +800,54 @@ def build_day2(page):
                 "has_gift": (i == target_idx), "color": box_color,
             })
         state["target"] = state["boxes"][target_idx]
-        game_area.update()
+        safe_update(game_area)
 
-        start_task(page, close_and_shuffle())
+        start_task(page, close_and_shuffle)
 
     async def close_and_shuffle():
+        my_round = state["round_id"]
         await asyncio.sleep(1.6)
-        if THREAD_STOP["flag"]:
+        if THREAD_STOP["flag"] or state["round_id"] != my_round:
             return
         for b in state["boxes"]:
             b["ctrl"].content = make_box_content(b["color"], "?")
         info_txt.value = "¡Observa cómo se mezclan!"
-        info_txt.update()
+        safe_update(info_txt)
         play_fx("shuffle")
-        game_area.update()
+        safe_update(game_area)
         await asyncio.sleep(0.6)
         for _ in range(4 + state["n_boxes"]):
-            if THREAD_STOP["flag"]:
+            if THREAD_STOP["flag"] or state["round_id"] != my_round:
                 return
             a, b = random.sample(state["boxes"], 2)
             a["pos_x"], b["pos_x"] = b["pos_x"], a["pos_x"]
             a["ctrl"].left = a["pos_x"]
             b["ctrl"].left = b["pos_x"]
-            game_area.update()
+            safe_update(game_area)
             await asyncio.sleep(0.45)
+        if THREAD_STOP["flag"] or state["round_id"] != my_round:
+            return
         info_txt.value = "¡Haz clic en la caja que crees que tiene el regalo!"
-        info_txt.update()
+        state["shuffling"] = False
+        safe_update(info_txt)
         for bx in state["boxes"]:
             bx["ctrl"].on_click = lambda e, b=bx: on_pick(b)
 
     def on_pick(box):
         if state["shuffling"] or state["won"]:
             return
+        state["shuffling"] = True
+        for bx in state["boxes"]:
+            bx["ctrl"].on_click = None
+
         if box["has_gift"]:
             state["hits"] += 1
             attempts_txt.value = f"Aciertos: {state['hits']}/3"
             play_fx("correct")
             box["ctrl"].content = make_box_content(box["color"], "✅")
-            box["ctrl"].update()
             info_txt.value = "¡Correcto! 🎉"
             info_txt.color = COLOR_GREEN
-            info_txt.update()
+            safe_update(attempts_txt, box["ctrl"], info_txt)
             if state["hits"] >= 3:
                 state["won"] = True
                 mark_day_complete(2, state["hits"])
@@ -747,19 +865,21 @@ def build_day2(page):
             play_fx("error")
             box["ctrl"].content = make_box_content(box["color"], "❌")
             t = state["target"]
-            t["ctrl"].content = make_box_content(t["color"], "🎁")
+            if t:
+                t["ctrl"].content = make_box_content(t["color"], "🎁")
+                safe_update(t["ctrl"])
             info_txt.value = "¡Incorrecto! Estaba en otra caja."
             info_txt.color = COLOR_RED
-            info_txt.update()
-            box["ctrl"].update()
-            t["ctrl"].update()
+            safe_update(box["ctrl"], info_txt)
 
         async def next_round():
+            my_round = state["round_id"]
             await asyncio.sleep(1.8)
-            if THREAD_STOP["flag"] or state["won"]:
+            if THREAD_STOP["flag"] or state["won"] or state["round_id"] != my_round:
                 return
             setup_round()
-        start_task(page, next_round())
+
+        start_task(page, next_round)
 
     return ft.Column([
         make_back_button(page), title,
@@ -838,13 +958,17 @@ def build_day3(page):
 
     gnome_emojis = ["🧝", "🧙", "🎅", "⛄", "🧑‍🎄"]
     gnome_positions = []
+    min_dist = 50
     tries = 0
-    while len(gnome_positions) < 20 and tries < 200:
+    while len(gnome_positions) < 20:
         gx = random.randint(20, W-40)
         gy = random.randint(150, H-50)
-        if all((gx-px)**2 + (gy-py)**2 > 50*50 for px, py in gnome_positions):
+        if all((gx-px)**2 + (gy-py)**2 > min_dist*min_dist for px, py in gnome_positions):
             gnome_positions.append((gx, gy))
         tries += 1
+        if tries > 200 and min_dist > 25:
+            min_dist -= 5
+            tries = 0
 
     gnomes = []
     for i, (gx, gy) in enumerate(gnome_positions):
@@ -871,9 +995,8 @@ def build_day3(page):
         state["found"] += 1
         found_txt.value = f"🧝 Encontrados: {state['found']}/20"
         g["ctrl"].opacity = 1.0
-        g["ctrl"].border = ft.border.all(3, COLOR_GOLD)
-        g["ctrl"].update()
-        found_txt.update()
+        g["ctrl"].border = ft.Border.all(3, COLOR_GOLD)
+        safe_update(g["ctrl"], found_txt)
         play_fx("correct")
         if state["found"] >= 20:
             state["running"] = False
@@ -892,17 +1015,14 @@ def build_day3(page):
     async def timer_thread():
         while state["running"] and state["time_left"] > 0 and not THREAD_STOP["flag"]:
             await asyncio.sleep(1)
-            if THREAD_STOP["flag"]:
+            if THREAD_STOP["flag"] or not state["running"]:
                 return
             state["time_left"] -= 1
             timer_txt.value = f"⏱ {state['time_left']}s"
-            if state["time_left"] <= 10:
+            if state["time_left"] <= 10 and state["time_left"] > 0:
                 play_fx("tick")
-            try:
-                timer_txt.update()
-            except Exception:
-                pass
-        if state["time_left"] <= 0 and state["running"]:
+            safe_update(timer_txt)
+        if state["time_left"] <= 0 and state["running"] and not THREAD_STOP["flag"]:
             state["running"] = False
             play_fx("lose")
             dlg = ft.AlertDialog(
@@ -918,7 +1038,7 @@ def build_day3(page):
             )
             page.show_dialog(dlg)
 
-    start_task(page, timer_thread())
+    start_task(page, timer_thread)
 
     return ft.Column([
         make_back_button(page), title,
@@ -932,14 +1052,14 @@ def build_day3(page):
 # ============================================================
 def build_day4(page):
     WORDS = [
-        ("A", "ÁNGEL",    "Ser celestial que anuncia el nacimiento."),
-        ("B", "BELÉN",    "Pueblo donde nació Jesús."),
-        ("C", "CARTA",    "Lo escribes a Santa para pedir regalos."),
-        ("D", "DULCE",    "Golosina típica de estas fechas."),
-        ("E", "ESTRELLA", "Brillaba sobre el pesebre la nochebuena."),
-        ("F", "FUEGO",    "Calienta la chimenea en Nochebuena."),
+        ("A", "ÁNGEL",     "Ser celestial que anuncia el nacimiento."),
+        ("B", "BELÉN",     "Pueblo donde nació Jesús."),
+        ("C", "CARTA",     "Lo escribes a Santa para pedir regalos."),
+        ("D", "DULCE",     "Golosina típica de estas fechas."),
+        ("E", "ESTRELLA",  "Brillaba sobre el pesebre la nochebuena."),
+        ("F", "FUEGO",     "Calienta la chimenea en Nochebuena."),
         ("G", "GUIRNALDA", "Adorno circular colgado en la puerta."),
-        ("H", "HIELO",    "Aparece cuando nieva y hace frío."),
+        ("H", "HIELO",     "Aparece cuando nieva y hace frío."),
         ("I", "INCIENSO",  "Resina aromática quemada por los Reyes."),
         ("J", "JUGUETE",   "Regalo clásico para los niños."),
         ("L", "LUCES",     "Bombillas que decoran el árbol."),
@@ -973,6 +1093,14 @@ def build_day4(page):
         on_submit=lambda e: check_answer(),
     )
 
+    def _normalize(text):
+        if not text:
+            return ""
+        return "".join(
+            c for c in unicodedata.normalize("NFD", text.strip().upper())
+            if unicodedata.category(c) != "Mn"
+        )
+
     def update_letter_colors():
         for i, btn in enumerate(letter_buttons):
             res = state["results"][i]
@@ -988,7 +1116,7 @@ def build_day4(page):
             else:
                 btn.bgcolor = COLOR_BG_LIGHT
                 btn.content.color = "white"
-            btn.update()
+            safe_update(btn)
 
     def select_letter(idx):
         if state["finished"]:
@@ -1005,17 +1133,16 @@ def build_day4(page):
         current_letter_txt.value = f"Letra {letra}"
         current_def_txt.value = defn
         answer_input.value = ""
-        current_letter_txt.update()
-        current_def_txt.update()
-        answer_input.update()
+        safe_update(current_letter_txt, current_def_txt, answer_input)
+        safe_focus(answer_input)
 
     def check_answer():
         if state["finished"]:
             return
         idx = state["current"]
         _, palabra, _ = WORDS[idx]
-        ans = (answer_input.value or "").strip().upper()
-        if ans == palabra:
+        ans = (answer_input.value or "").strip()
+        if _normalize(ans) == _normalize(palabra):
             state["results"][idx] = "ok"
             play_fx("correct")
         else:
@@ -1060,10 +1187,10 @@ def build_day4(page):
         )
         page.show_dialog(dlg)
 
-    answer_btn = ft.ElevatedButton("Responder", on_click=lambda e: check_answer(),
-                                   bgcolor=COLOR_GREEN, color="white", icon=ft.Icons.CHECK)
-    pass_btn = ft.ElevatedButton("Pasapalabra", on_click=lambda e: pasapalabra(),
-                                 bgcolor=COLOR_GOLD, color="black", icon=ft.Icons.ARROW_FORWARD)
+    answer_btn = ft.Button(content="Responder", on_click=lambda e: check_answer(),
+                           bgcolor=COLOR_GREEN, color="white", icon=ft.Icons.CHECK)
+    pass_btn = ft.Button(content="Pasapalabra", on_click=lambda e: pasapalabra(),
+                         bgcolor=COLOR_GOLD, color="black", icon=ft.Icons.ARROW_FORWARD)
 
     state["current"] = 0
 
@@ -1073,7 +1200,7 @@ def build_day4(page):
             return
         show_current()
         update_letter_colors()
-    start_task(page, init_later())
+    start_task(page, init_later)
 
     center_panel = ft.Container(
         content=ft.Column([
@@ -1101,7 +1228,7 @@ SNOWFLAKE_CHARS = ["❄", "❅", "❆", "✻", "✼", "❉", "❊", "✢", "✤"
 
 
 def build_day5(page):
-    title = ft.Text("DÍA 5 · Último juego",
+    title = ft.Text("DÍA 5 · Rompecabezas Navideño",
                     size=28, weight=ft.FontWeight.BOLD, color=COLOR_GOLD)
 
     state = {
@@ -1123,8 +1250,8 @@ def build_day5(page):
                     size=14, text_align=ft.TextAlign.CENTER),
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
         actions=[
-            ft.ElevatedButton("¡Vamos! 🧩", on_click=lambda e: (page.pop_dialog(), start_puzzle()),
-                              bgcolor=COLOR_GREEN, color="white"),
+            ft.Button(content="¡Vamos! 🧩", on_click=lambda e: (page.pop_dialog(), start_puzzle()),
+                      bgcolor=COLOR_GREEN, color="white"),
         ],
     )
 
@@ -1136,13 +1263,16 @@ def build_day5(page):
     grid_wrap = ft.Container(content=grid, padding=10, border_radius=12,
                              bgcolor=COLOR_BG_LIGHT, width=460)
 
+    # Vista previa organizada en 4x3 para que coincida exactamente con la cuadrícula
     preview = ft.Container(
         content=ft.Column([
             ft.Text("Modelo", size=14, color=COLOR_GOLD_LIGHT),
-            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[:6]],
-                   spacing=2),
-            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[6:]],
-                   spacing=2),
+            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[0:4]],
+                   spacing=4, alignment=ft.MainAxisAlignment.CENTER),
+            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[4:8]],
+                   spacing=4, alignment=ft.MainAxisAlignment.CENTER),
+            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[8:12]],
+                   spacing=4, alignment=ft.MainAxisAlignment.CENTER),
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
         padding=10, border_radius=12, bgcolor=COLOR_BG_LIGHT, width=200,
     )
@@ -1151,48 +1281,57 @@ def build_day5(page):
 
     def make_piece(pos, orig):
         char = SNOWFLAKE_CHARS[orig]
-        return ft.Container(
+        p_data = {"current_pos": pos, "original_pos": orig, "ctrl": None}
+        ctrl = ft.Container(
             width=PIECE_SIZE, height=PIECE_SIZE,
             bgcolor=COLOR_BG, border_radius=8,
-            border=ft.border.all(1, COLOR_BG_LIGHT),
+            border=ft.Border.all(1, COLOR_BG_LIGHT),
             content=ft.Text(char, size=44, color=COLOR_BLUE_SNOW),
             alignment=ft.Alignment.CENTER,
-            on_click=lambda e, p=pos: on_click_piece(p),
+            on_click=lambda e, piece=p_data: on_click_piece(piece),
             animate=ft.Animation(150, ft.AnimationCurve.EASE_OUT),
         )
+        p_data["ctrl"] = ctrl
+        return p_data
 
     def build_pieces():
         state["pieces"] = []
         grid.controls.clear()
         order = list(range(12))
         random.shuffle(order)
+        while order == list(range(12)):
+            random.shuffle(order)
+
         for pos, orig in enumerate(order):
             piece = make_piece(pos, orig)
-            state["pieces"].append({"current_pos": pos, "original_pos": orig, "ctrl": piece})
-            grid.controls.append(piece)
+            state["pieces"].append(piece)
+            grid.controls.append(piece["ctrl"])
 
     def refresh_grid():
         grid.controls.clear()
         for p in sorted(state["pieces"], key=lambda x: x["current_pos"]):
             grid.controls.append(p["ctrl"])
-        grid.update()
+        safe_update(grid)
 
-    def on_click_piece(pos):
+    def on_click_piece(piece):
         if state["solved"] or not state["running"]:
             return
-        piece = next(p for p in state["pieces"] if p["current_pos"] == pos)
+
         if state["selected"] is None:
             state["selected"] = piece
-            piece["ctrl"].border = ft.border.all(3, COLOR_GOLD)
+            piece["ctrl"].border = ft.Border.all(3, COLOR_GOLD)
+            safe_update(piece["ctrl"])
             play_fx("click")
         else:
             if state["selected"] is piece:
-                piece["ctrl"].border = ft.border.all(1, COLOR_BG_LIGHT)
+                piece["ctrl"].border = ft.Border.all(1, COLOR_BG_LIGHT)
+                safe_update(piece["ctrl"])
                 state["selected"] = None
                 return
+
             sel = state["selected"]
-            sel["ctrl"].border = ft.border.all(1, COLOR_BG_LIGHT)
-            piece["ctrl"].border = ft.border.all(1, COLOR_BG_LIGHT)
+            sel["ctrl"].border = ft.Border.all(1, COLOR_BG_LIGHT)
+            piece["ctrl"].border = ft.Border.all(1, COLOR_BG_LIGHT)
             sel["current_pos"], piece["current_pos"] = piece["current_pos"], sel["current_pos"]
             state["selected"] = None
             play_fx("shuffle")
@@ -1226,44 +1365,53 @@ def build_day5(page):
     async def timer_thread():
         while state["running"] and not state["solved"] and not THREAD_STOP["flag"]:
             await asyncio.sleep(1)
-            if THREAD_STOP["flag"] or state["solved"]:
+            if THREAD_STOP["flag"] or state["solved"] or not state["running"]:
                 return
             state["time_left"] -= 1
             timer_txt.value = f"⏱ {state['time_left']}s"
-            if state["time_left"] <= 5:
+            if state["time_left"] <= 5 and state["time_left"] > 0:
                 play_fx("tick")
-            try:
-                timer_txt.update()
-            except Exception:
-                pass
-            if state["time_left"] <= 0:
+            safe_update(timer_txt)
+            if state["time_left"] <= 0 and state["running"] and not state["solved"]:
                 shuffle_again()
 
     def shuffle_again():
+        state["running"] = False
+        if state["selected"]:
+            try:
+                state["selected"]["ctrl"].border = ft.Border.all(1, COLOR_BG_LIGHT)
+            except Exception:
+                pass
+            state["selected"] = None
+
         state["attempts"] += 1
         attempts_txt.value = f"Intentos: {state['attempts']}"
-        attempts_txt.update()
         play_fx("lose")
         info_txt.value = "⏱ ¡Se acabó el tiempo! Mezclando de nuevo..."
         info_txt.color = COLOR_RED
-        info_txt.update()
+        safe_update(attempts_txt, info_txt)
+
         positions = list(range(12))
         random.shuffle(positions)
+        while positions == [p["current_pos"] for p in state["pieces"]]:
+            random.shuffle(positions)
+
         for p, new_pos in zip(state["pieces"], positions):
             p["current_pos"] = new_pos
         refresh_grid()
         state["time_left"] = 20
         timer_txt.value = "⏱ 20s"
-        timer_txt.update()
-        start_task(page, _after_shuffle())
+        safe_update(timer_txt)
+        start_task(page, _after_shuffle)
 
     async def _after_shuffle():
         await asyncio.sleep(1.2)
         if THREAD_STOP["flag"] or state["solved"]:
             return
+        state["running"] = True
         info_txt.value = "¡Otra oportunidad! Toca dos piezas para intercambiarlas."
         info_txt.color = COLOR_SNOW
-        info_txt.update()
+        safe_update(info_txt)
 
     def start_puzzle():
         if state["puzzle_started"]:
@@ -1278,16 +1426,16 @@ def build_day5(page):
         info_txt.color = COLOR_SNOW
         build_pieces()
         refresh_grid()
-        info_txt.update()
-        attempts_txt.update()
-        start_task(page, timer_thread())
+        safe_update(info_txt, attempts_txt)
+        start_task(page, timer_thread)
 
     async def show_thanks_later():
         await asyncio.sleep(0.2)
         if THREAD_STOP["flag"]:
             return
         page.show_dialog(thanks_dlg)
-    start_task(page, show_thanks_later())
+
+    start_task(page, show_thanks_later)
 
     return ft.Column([
         make_back_button(page), title,
@@ -1301,11 +1449,12 @@ def build_day5(page):
 #  MAIN
 # ============================================================
 def main(page: ft.Page):
+    PAGE_REF["page"] = page
     page.title = "🎄 Calendario de Adviento"
     page.bgcolor = COLOR_BG
     page.padding = 20
     page.scroll = ft.ScrollMode.AUTO
-    # Flet 1.0: page.window es un objeto.
+
     try:
         page.window.width = 1100
         page.window.height = 780
@@ -1315,12 +1464,12 @@ def main(page: ft.Page):
 
     ensure_assets()
     init_audio(page)
-    set_music(True)
     MUSIC_STATE["on"] = True
 
     page.add(build_home(page))
     page.update()
+    set_music(True)
 
 
 if __name__ == "__main__":
-    ft.run(main)
+    ft.run(main, assets_dir=str(ASSETS_DIR))
