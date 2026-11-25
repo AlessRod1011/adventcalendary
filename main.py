@@ -1,5 +1,6 @@
 import flet as ft
 import flet_audio as fta
+import flet.canvas as cv
 import json
 import random
 import time
@@ -194,65 +195,49 @@ def mark_day_complete(day, score):
 
 # ============================================================
 #  AUDIO HELPERS
-#  En Flet 1.x Audio debe añadirse a page.overlay para vincularse
-#  a la página y poder reproducirse.
+#  En Flet 1.x Audio es un "Service": NO se añade a page.overlay
+#  (eso muestra "Unknown control: Audio"). Se registra solo en la
+#  página al crearlo, y hay que guardar una referencia para que
+#  no se elimine. El src es relativo a assets_dir.
 # ============================================================
 def init_audio(page):
-    """Inicializa audio y monta los controles en page.overlay."""
+    """Crea los servicios de audio (se registran solos en la página)."""
     PAGE_REF["page"] = page
     fx_names = ["correct", "error", "tick", "drop", "click", "shuffle", "win", "lose"]
     try:
         for n in fx_names:
-            p = ASSETS_DIR / f"fx_{n}.wav"
-            a = fta.Audio(src=str(p), autoplay=False)
-            AUDIO_REFS[n] = a
-            page.overlay.append(a)
-        music_path = ASSETS_DIR / "music_jingle.wav"
-        music = fta.Audio(
-            src=str(music_path),
+            AUDIO_REFS[n] = fta.Audio(src=f"fx_{n}.wav", autoplay=False, volume=0.8)
+        AUDIO_REFS["music"] = fta.Audio(
+            src="music_jingle.wav",
             autoplay=False,
+            volume=0.5,
             release_mode=fta.ReleaseMode.LOOP,
         )
-        AUDIO_REFS["music"] = music
-        page.overlay.append(music)
     except Exception as exc:
         print(f"Audio desactivado: {exc}")
         AUDIO_REFS.clear()
 
 
-def _schedule_audio(awaitable):
-    """Programa operaciones async de audio en el loop correspondiente."""
-    if not awaitable:
-        return
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(awaitable)
-        return
-    except RuntimeError:
-        pass
-
+def _run_audio(method_name, audio):
+    """Ejecuta play()/pause() del audio en el loop de la página, sin bloquear."""
     page = PAGE_REF.get("page")
-    if page:
-        try:
-            loop = page.session.connection.loop
-            if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(awaitable, loop)
-                return
-        except Exception:
-            pass
+    if not page or not audio:
+        return
 
-    close = getattr(awaitable, "close", None)
-    if close:
-        close()
+    async def _do():
+        try:
+            await getattr(audio, method_name)()
+        except Exception as exc:
+            print(f"Audio {method_name} falló: {exc}")
+
+    try:
+        page.run_task(_do)
+    except Exception:
+        pass
 
 
 def play_fx(name):
-    audio = AUDIO_REFS.get(name)
-    if audio:
-        try:
-            _schedule_audio(audio.play())
-        except Exception:
-            pass
+    _run_audio("play", AUDIO_REFS.get(name))
 
 
 def set_music(on):
@@ -260,11 +245,12 @@ def set_music(on):
     music = AUDIO_REFS.get("music")
     if not music:
         return
-    try:
-        operation = music.play() if on else music.pause()
-        _schedule_audio(operation)
-    except Exception:
-        pass
+    if on:
+        # play() reinicia desde el principio; si ya sonó antes, reanudar
+        _run_audio("resume" if MUSIC_STATE.get("started") else "play", music)
+        MUSIC_STATE["started"] = True
+    else:
+        _run_audio("pause", music)
 
 
 # ============================================================
@@ -283,10 +269,19 @@ def safe_update(*controls):
 def safe_focus(ctrl):
     """Llama a focus() y programa su corrutina si es asíncrona."""
     if ctrl and hasattr(ctrl, "focus"):
+        page = PAGE_REF.get("page")
+
+        async def _do():
+            try:
+                res = ctrl.focus()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass
+
         try:
-            res = ctrl.focus()
-            if asyncio.iscoroutine(res):
-                _schedule_audio(res)
+            if page:
+                page.run_task(_do)
         except Exception:
             pass
 
@@ -378,27 +373,60 @@ def build_home(page):
         size=18, color=COLOR_SNOW, text_align=ft.TextAlign.CENTER,
     )
 
-    star = ft.Text("⭐", size=48, text_align=ft.TextAlign.CENTER)
+    # Árbol dibujado con canvas: 3 triángulos verdes, tronco, guirnalda,
+    # bolitas y estrella. Todo cabe en un lienzo de 240x300.
+    TW, TH = 240, 300
+    cx = TW / 2
 
-    layers = []
-    for i, (w, col) in enumerate([(200, COLOR_GREEN), (160, "#2E7D32"), (120, COLOR_GREEN_DARK)]):
-        layers.append(ft.Container(
-            width=w, height=90, bgcolor=col,
-            border_radius=ft.BorderRadius.only(top_left=100, top_right=100),
-            margin=ft.Margin.only(top=-45 if i > 0 else 0),
-        ))
-    tree = ft.Column(layers, alignment=ft.MainAxisAlignment.CENTER,
-                     horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+    def triangle(top_y, base_y, half_w, color):
+        return cv.Path(
+            [
+                cv.Path.MoveTo(cx, top_y),
+                cv.Path.LineTo(cx + half_w, base_y),
+                cv.Path.LineTo(cx - half_w, base_y),
+                cv.Path.Close(),
+            ],
+            paint=ft.Paint(color=color, style=ft.PaintingStyle.FILL),
+        )
 
-    baubles = ft.Stack([
-        ft.Text("🔴", size=18, left=20, top=120),
-        ft.Text("🟡", size=18, left=170, top=100),
-        ft.Text("🔵", size=18, left=80, top=180),
-        ft.Text("🔴", size=18, left=130, top=200),
-        ft.Text("🟡", size=18, left=60, top=240),
-    ], width=220, height=280)
+    def star_path(x, y, r_out, r_in):
+        pts = []
+        for k in range(10):
+            ang = -math.pi / 2 + k * math.pi / 5
+            r = r_out if k % 2 == 0 else r_in
+            pts.append((x + r * math.cos(ang), y + r * math.sin(ang)))
+        elems = [cv.Path.MoveTo(*pts[0])] + [cv.Path.LineTo(*p) for p in pts[1:]]
+        elems.append(cv.Path.Close())
+        return cv.Path(elems, paint=ft.Paint(color=COLOR_GOLD, style=ft.PaintingStyle.FILL))
 
-    trunk = ft.Container(width=40, height=60, bgcolor="#5D4037", border_radius=5)
+    tree_shapes = [
+        # tronco
+        cv.Rect(cx - 18, 245, 36, 45, border_radius=4,
+                paint=ft.Paint(color="#6D4C41", style=ft.PaintingStyle.FILL)),
+        # capas (de abajo hacia arriba para que se superpongan bien)
+        triangle(140, 252, 112, COLOR_GREEN_DARK),
+        triangle(85, 195, 88, "#2E7D32"),
+        triangle(32, 135, 62, COLOR_GREEN),
+        # guirnaldas
+        cv.Line(cx - 45, 110, cx + 52, 125,
+                paint=ft.Paint(color=COLOR_GOLD_LIGHT, stroke_width=3)),
+        cv.Line(cx + 70, 160, cx - 72, 182,
+                paint=ft.Paint(color=COLOR_GOLD_LIGHT, stroke_width=3)),
+        cv.Line(cx - 95, 225, cx + 98, 238,
+                paint=ft.Paint(color=COLOR_GOLD_LIGHT, stroke_width=3)),
+    ]
+    for bx, by, bcol in [
+        (cx - 20, 95, COLOR_RED), (cx + 25, 118, COLOR_BLUE_SNOW),
+        (cx - 40, 165, COLOR_GOLD), (cx + 45, 175, COLOR_RED),
+        (cx + 5, 150, COLOR_PURPLE), (cx - 70, 225, COLOR_BLUE_SNOW),
+        (cx - 15, 215, COLOR_RED), (cx + 40, 222, COLOR_GOLD),
+        (cx + 80, 240, COLOR_PURPLE), (cx - 90, 243, COLOR_GOLD),
+    ]:
+        tree_shapes.append(cv.Circle(bx, by, 7, paint=ft.Paint(color=bcol, style=ft.PaintingStyle.FILL)))
+        tree_shapes.append(cv.Circle(bx - 2, by - 2, 2, paint=ft.Paint(color="white", style=ft.PaintingStyle.FILL)))
+    tree_shapes.append(star_path(cx, 26, 22, 9))
+
+    tree_canvas = cv.Canvas(tree_shapes, width=TW, height=TH)
 
     gifts = ft.Row(
         [build_gift(page, d, completed, scores) for d in range(1, 6)],
@@ -428,9 +456,7 @@ def build_home(page):
         topbar, title, subtitle,
         ft.Container(
             content=ft.Column([
-                ft.Container(content=star, alignment=ft.Alignment.CENTER),
-                ft.Stack([tree, baubles], width=220, height=280),
-                trunk, gifts,
+                tree_canvas, gifts,
             ], alignment=ft.MainAxisAlignment.CENTER,
                horizontal_alignment=ft.CrossAxisAlignment.CENTER),
             alignment=ft.Alignment.CENTER, expand=True,
@@ -751,7 +777,11 @@ def build_day2(page):
 
     def make_box_content(box_color, center):
         if center == "?":
-            center_ctrl = ft.Text("?", size=32, color="white", left=24, top=18)
+            center_ctrl = ft.Container(
+                content=ft.Text("?", size=26, color="white", weight=ft.FontWeight.BOLD),
+                width=36, height=36, left=17, top=17, border_radius=18,
+                bgcolor="#99000000", alignment=ft.Alignment.CENTER,
+            )
         else:
             center_ctrl = ft.Text(center, size=36, left=18, top=15)
         return ft.Stack([
@@ -792,13 +822,17 @@ def build_day2(page):
             ctrl = ft.Container(
                 content=content, left=positions[i], top=150,
                 width=70, height=70,
-                animate=ft.Animation(400, ft.AnimationCurve.EASE_IN_OUT),
+                animate_position=ft.Animation(400, ft.AnimationCurve.EASE_IN_OUT),
             )
-            game_area.controls.append(ctrl)
-            state["boxes"].append({
+            box_data = {
                 "idx": i, "ctrl": ctrl, "pos_x": positions[i],
                 "has_gift": (i == target_idx), "color": box_color,
-            })
+            }
+            # El on_click se asigna desde el inicio para que el cliente lo
+            # conozca; on_pick ignora clics mientras se mezcla.
+            ctrl.on_click = lambda e, b=box_data: on_pick(b)
+            game_area.controls.append(ctrl)
+            state["boxes"].append(box_data)
         state["target"] = state["boxes"][target_idx]
         safe_update(game_area)
 
@@ -830,15 +864,11 @@ def build_day2(page):
         info_txt.value = "¡Haz clic en la caja que crees que tiene el regalo!"
         state["shuffling"] = False
         safe_update(info_txt)
-        for bx in state["boxes"]:
-            bx["ctrl"].on_click = lambda e, b=bx: on_pick(b)
 
     def on_pick(box):
         if state["shuffling"] or state["won"]:
             return
         state["shuffling"] = True
-        for bx in state["boxes"]:
-            bx["ctrl"].on_click = None
 
         if box["has_gift"]:
             state["hits"] += 1
@@ -1248,7 +1278,7 @@ def build_day5(page):
                     size=16, text_align=ft.TextAlign.CENTER, color=COLOR_BLUE_SNOW),
             ft.Text("Si no lo logras, las piezas se desordenarán y tendrás otra oportunidad. ¡Hasta que lo consigas!",
                     size=14, text_align=ft.TextAlign.CENTER),
-        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
         actions=[
             ft.Button(content="¡Vamos! 🧩", on_click=lambda e: (page.pop_dialog(), start_puzzle()),
                       bgcolor=COLOR_GREEN, color="white"),
@@ -1267,14 +1297,14 @@ def build_day5(page):
     preview = ft.Container(
         content=ft.Column([
             ft.Text("Modelo", size=14, color=COLOR_GOLD_LIGHT),
-            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[0:4]],
-                   spacing=4, alignment=ft.MainAxisAlignment.CENTER),
-            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[4:8]],
-                   spacing=4, alignment=ft.MainAxisAlignment.CENTER),
-            ft.Row([ft.Text(c, size=22, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[8:12]],
-                   spacing=4, alignment=ft.MainAxisAlignment.CENTER),
+            ft.Row([ft.Text(c, size=32, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[0:4]],
+                   spacing=8, alignment=ft.MainAxisAlignment.CENTER),
+            ft.Row([ft.Text(c, size=32, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[4:8]],
+                   spacing=8, alignment=ft.MainAxisAlignment.CENTER),
+            ft.Row([ft.Text(c, size=32, color=COLOR_BLUE_SNOW) for c in SNOWFLAKE_CHARS[8:12]],
+                   spacing=8, alignment=ft.MainAxisAlignment.CENTER),
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-        padding=10, border_radius=12, bgcolor=COLOR_BG_LIGHT, width=200,
+        padding=12, border_radius=12, bgcolor=COLOR_BG_LIGHT, width=230,
     )
 
     PIECE_SIZE = 90
@@ -1354,7 +1384,7 @@ def build_day5(page):
                         text_align=ft.TextAlign.CENTER),
                 ft.Text("¡Gracias por completar el calendario de adviento! 🎄",
                         size=16, text_align=ft.TextAlign.CENTER, color=COLOR_GOLD),
-            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
             actions=[
                 ft.TextButton("Volver al inicio", on_click=lambda e: (page.pop_dialog(), go_to(page, build_home))),
             ],
@@ -1412,6 +1442,8 @@ def build_day5(page):
         info_txt.value = "¡Otra oportunidad! Toca dos piezas para intercambiarlas."
         info_txt.color = COLOR_SNOW
         safe_update(info_txt)
+        # El temporizador anterior terminó al pausar; arrancar uno nuevo
+        start_task(page, timer_thread)
 
     def start_puzzle():
         if state["puzzle_started"]:

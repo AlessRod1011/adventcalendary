@@ -39,7 +39,8 @@ def test_audio():
     main.ensure_assets()
     main.init_audio(p)
     assert len(main.AUDIO_REFS) > 0, "AUDIO_REFS should not be empty"
-    assert len(p.overlay) == len(main.AUDIO_REFS), "All audios should be mounted in page.overlay"
+    # En Flet 1.x Audio es un Service: no debe ir en page.overlay
+    assert len(p.overlay) == 0, "Audio services must not be added to page.overlay"
     main.play_fx("click")
     main.set_music(True)
     main.set_music(False)
